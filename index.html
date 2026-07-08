@@ -3,52 +3,56 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bay Area GOES-18 (COD Tahoe sector)</title>
+<title>Bay Area GOES-18 + KMUX Radar</title>
+<link rel="stylesheet"
+  href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
                font-family: -apple-system, sans-serif; }
   #stage { position: absolute; }
   #stage img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
-  #stage img.frame { visibility: hidden; }
+  #radarWrap { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+               display: none; }
+  #radarMap { width: 100%; height: 100%; background: #000; }
+  .radarTiles { image-rendering: pixelated; }
   #status { position: absolute; bottom: 6px; right: 10px; color: #9acd32;
-            font-size: 12px; text-shadow: 0 0 3px #000; }
+            font-size: 12px; text-shadow: 0 0 3px #000; z-index: 1000; }
   #product { position: absolute; top: 8px; left: 10px; color: #fff;
              font-size: 14px; background: rgba(0,0,0,0.55); padding: 4px 10px;
-             border-radius: 6px; opacity: 0; transition: opacity 0.4s; }
+             border-radius: 6px; opacity: 0; transition: opacity 0.4s;
+             z-index: 1000; }
   #err { color: #f66; padding: 16px; font-size: 14px; display: none;
-         position: absolute; top: 0; left: 0; }
+         position: absolute; top: 0; left: 0; z-index: 1000; }
 </style>
 </head>
 <body>
 <div id="stage">
-  <div id="frameHolder"></div>
+  <img id="sat" alt="">
   <img id="map" alt="">
 </div>
+<div id="radarWrap"><div id="radarMap"></div></div>
 <div id="product"></div>
 <div id="status"></div>
 <div id="err">No frames found for this product. COD may be down.</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 // ---- Settings ----
 
-// Animation on/off. Set to false for a still image of the latest frame
-// that refreshes itself every 5 minutes. Lightest option, nothing to reset.
+// Animation for the satellite views. false = still image of the latest
+// frame, refreshing every 5 minutes. Recommended for Teapot.
 const ANIMATE = false;
 
-// Tap the image to cycle through these. Confirmed COD product codes:
-// 01-16 (ABI bands), truecolor, airmass, natcolor, natcolorfire,
-// ntmicro, dcphase, simplewv, sandwich. truecolor blends to IR at night.
+// Tap the image to cycle through these. Satellite entries use COD codes
+// (01-16, truecolor, ntmicro, etc). The kmux entry is the radar map.
 const PRODUCTS = [
   { code: "02",        label: "Band 2 Visible (0.5 km)" },
-  { code: "truecolor", label: "True Color / IR at night (1 km)" }
+  { code: "truecolor", label: "True Color / IR at night (1 km)" },
+  { code: "kmux", radar: true, label: "KMUX Radar (N0B, 0.25 km)" }
 ];
 
+// -- Satellite settings --
 const SECTOR_BASE = "https://weather.cod.edu/wxdata/satellite/local/Tahoe/";
 const MAP_URL = SECTOR_BASE + "maps/Tahoe_map.png";
-
-// Frames arrive every 5 minutes at UTC minutes ending in 1 or 6. The
-// seconds in the filename have drifted over time, so history probing
-// tries each known value. The newest frame always comes from the
-// current/ endpoint, no timestamp needed.
 const SECONDS_LIST = ["17", "19", "24", "25"];
 
 // Focus point as fractions of the 1600x900 frame (0 = left/top).
@@ -58,26 +62,37 @@ const FOCUS_Y = 0.60;
 // Zoom. 1 = frame just covers the window. Higher pushes in on the Bay.
 const ZOOM = 2;
 
-// Animation settings (ignored when ANIMATE is false).
-const FRAME_COUNT = 6;       // total frames in the loop, including latest
-const FRAME_MS = 400;        // per frame
-const LAST_FRAME_MS = 1800;  // hold on newest frame
-const RECHECK_MIN = 5;       // look for new frames this often
+// -- Radar settings --
+// Map center [latitude, longitude] and zoom level (8 = wide Bay Area,
+// 9 = tighter). Tune these like FOCUS/ZOOM.
+const RADAR_CENTER = [37.80, -122.30];
+const RADAR_ZOOM = 8;
+// KMUX radar site location (Mt Umunhum), shown as a small dot.
+const KMUX_LOC = [37.155, -121.898];
+
+// -- Shared timing --
+const FRAME_COUNT = 6;       // loop length if ANIMATE is true
+const FRAME_MS = 400;
+const LAST_FRAME_MS = 1800;
+const RECHECK_MIN = 5;       // refresh the active view this often
 
 // ---- No changes needed below ----
 
 const stage = document.getElementById("stage");
-const holder = document.getElementById("frameHolder");
+const sat = document.getElementById("sat");
+const radarWrap = document.getElementById("radarWrap");
 const statusEl = document.getElementById("status");
 const productEl = document.getElementById("product");
 const errEl = document.getElementById("err");
 document.getElementById("map").src = MAP_URL;
 
 let productIndex = 0;
-let frameEls = [];   // [{el, label}] oldest to newest, already loaded
+let frames = [];
 let animTimer = null;
 let labelTimer = null;
 let loadToken = 0;
+let leafletMap = null;
+let radarLayer = null;
 
 const pad = n => String(n).padStart(2, "0");
 
@@ -91,8 +106,13 @@ const pad = n => String(n).padStart(2, "0");
   if (i >= 0) productIndex = i;
 })();
 
+// ---- Satellite view ----
+
+// Bucketed cache parameter: changes only every 5 minutes, so Teapot's
+// rapid reloads reuse Safari's cached copy instead of re-downloading.
 function urlCurrent(code) {
-  return SECTOR_BASE + "current/Tahoe." + code + ".jpg?t=" + Math.floor(Date.now() / 300000);
+  return SECTOR_BASE + "current/Tahoe." + code + ".jpg?t=" +
+    Math.floor(Date.now() / 300000);
 }
 
 function urlHistoric(code, d, secs) {
@@ -113,105 +133,76 @@ function candidateTimes(count) {
   return out;
 }
 
-// Load an image fully; resolve with the element or null.
-function loadImg(url) {
+function probe(url) {
   return new Promise(resolve => {
     const im = new Image();
-    im.className = "frame";
-    im.onload = () => resolve(im);
-    im.onerror = () => resolve(null);
+    im.onload = () => resolve(true);
+    im.onerror = () => resolve(false);
     im.src = url;
   });
-}
-
-function showOnly(el, label) {
-  for (const f of frameEls) f.el.style.visibility = "hidden";
-  el.style.visibility = "visible";
-  statusEl.textContent = label;
 }
 
 async function loadFrames() {
   const token = ++loadToken;
   const code = PRODUCTS[productIndex].code;
-  showProductLabel(PRODUCTS[productIndex].label);
 
-  // Step 1: get the newest frame and show it IMMEDIATELY.
-  const curEl = await loadImg(urlCurrent(code));
+  const cur = urlCurrent(code);
+  const ok = await probe(cur);
   if (token !== loadToken) return;
-  if (!curEl) {
+  if (!ok) {
     errEl.style.display = "block";
     return;
   }
   errEl.style.display = "none";
-
-  // Swap in the new frame set, starting with just the latest.
-  holder.innerHTML = "";
-  frameEls = [{ el: curEl, label: "latest" }];
-  holder.appendChild(curEl);
-  showOnly(curEl, "latest");
+  frames = [{ url: cur, label: "latest" }];
+  sat.src = cur;
+  statusEl.textContent = "latest";
 
   if (!ANIMATE) return;
 
-  // Step 2: quietly build the history for the loop in the background.
   const history = [];
   const times = candidateTimes(FRAME_COUNT + 5);
   for (const t of times) {
     if (history.length >= FRAME_COUNT - 1) break;
     for (const secs of SECONDS_LIST) {
-      const el = await loadImg(urlHistoric(code, t, secs));
-      if (token !== loadToken) return;
-      if (el) {
+      const url = urlHistoric(code, t, secs);
+      if (await probe(url)) {
         history.push({
-          el: el,
+          url: url,
           label: pad(t.getUTCHours()) + ":" + pad(t.getUTCMinutes()) + "Z"
         });
         break;
       }
+      if (token !== loadToken) return;
     }
+    if (token !== loadToken) return;
   }
   if (token !== loadToken) return;
 
-  history.reverse();  // oldest first
-  for (const f of history) holder.appendChild(f.el);
-  frameEls = history.concat(frameEls);  // history + latest at the end
-
+  history.reverse();
+  frames = history.concat(frames);
   startAnimation();
 }
 
 function startAnimation() {
   if (animTimer) clearTimeout(animTimer);
-  if (frameEls.length < 2) return;
+  if (frames.length < 2) return;
   let i = 0;
   function step() {
-    const f = frameEls[i];
-    showOnly(f.el, f.label);
-    const dwell = (i === frameEls.length - 1) ? LAST_FRAME_MS : FRAME_MS;
-    i = (i + 1) % frameEls.length;
+    const f = frames[i];
+    sat.src = f.url;
+    statusEl.textContent = f.label;
+    const dwell = (i === frames.length - 1) ? LAST_FRAME_MS : FRAME_MS;
+    i = (i + 1) % frames.length;
     animTimer = setTimeout(step, dwell);
   }
   step();
 }
 
-function showProductLabel(text) {
-  productEl.textContent = text;
-  productEl.style.opacity = "1";
-  if (labelTimer) clearTimeout(labelTimer);
-  labelTimer = setTimeout(() => { productEl.style.opacity = "0"; }, 2500);
-}
-
-function switchProduct() {
-  productIndex = (productIndex + 1) % PRODUCTS.length;
-  try { localStorage.setItem("product", PRODUCTS[productIndex].code); } catch (e) {}
-  if (animTimer) clearTimeout(animTimer);
-  loadFrames();
-}
-
-document.body.addEventListener("click", switchProduct);
-
 function layout() {
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const iw = 1600, ih = 900;  // COD localized sector frame size
+  const iw = 1600, ih = 900;
   const scale = Math.max(vw / iw, vh / ih) * ZOOM;
   const w = iw * scale;
   const h = ih * scale;
@@ -225,10 +216,104 @@ function layout() {
   stage.style.top = y + "px";
 }
 
+// ---- Radar view ----
+
+function ensureRadarMap() {
+  if (leafletMap) {
+    leafletMap.invalidateSize();
+    return;
+  }
+  leafletMap = L.map("radarMap", {
+    zoomControl: false, dragging: false, touchZoom: false,
+    scrollWheelZoom: false, doubleClickZoom: false, boxZoom: false,
+    keyboard: false, tapHold: false
+  }).setView(RADAR_CENTER, RADAR_ZOOM);
+  L.tileLayer(
+    "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    { subdomains: "abcd", maxZoom: 12,
+      attribution: "&copy; OSM &copy; CARTO | radar: IEM" }
+  ).addTo(leafletMap);
+  L.circleMarker(KMUX_LOC, {
+    radius: 3, color: "#9acd32", fillColor: "#9acd32", fillOpacity: 1
+  }).addTo(leafletMap);
+}
+
+function refreshRadar() {
+  ensureRadarMap();
+  const bucket = Math.floor(Date.now() / 300000);
+  if (radarLayer) leafletMap.removeLayer(radarLayer);
+  radarLayer = L.tileLayer(
+    "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/" +
+    "ridge::MUX-N0B-0/{z}/{x}/{y}.png?_=" + bucket,
+    { className: "radarTiles", maxZoom: 12, opacity: 1 }
+  ).addTo(leafletMap);
+  fetchScanTime();
+}
+
+// Scan time from IEM metadata; falls back to a plain label if the
+// format differs or the request is blocked.
+async function fetchScanTime() {
+  try {
+    const r = await fetch(
+      "https://mesonet.agron.iastate.edu/data/gis/images/4326/ridge/MUX/N0B_0.json"
+    );
+    if (!r.ok) throw new Error("bad status");
+    const j = await r.json();
+    const valid = j && j.meta && (j.meta.valid || j.meta.utc_valid);
+    if (valid) {
+      const m = String(valid).match(/T(\d{2}:\d{2})/);
+      statusEl.textContent = "KMUX scan " + (m ? m[1] + "Z" : valid);
+      return;
+    }
+    throw new Error("no time field");
+  } catch (e) {
+    statusEl.textContent = "KMUX N0B";
+  }
+}
+
+// ---- Product switching ----
+
+function render() {
+  const p = PRODUCTS[productIndex];
+  showProductLabel(p.label);
+  if (animTimer) clearTimeout(animTimer);
+  if (p.radar) {
+    stage.style.display = "none";
+    errEl.style.display = "none";
+    radarWrap.style.display = "block";
+    refreshRadar();
+  } else {
+    radarWrap.style.display = "none";
+    stage.style.display = "block";
+    loadFrames();
+  }
+}
+
+function refreshActive() {
+  const p = PRODUCTS[productIndex];
+  if (p.radar) refreshRadar();
+  else loadFrames();
+}
+
+function showProductLabel(text) {
+  productEl.textContent = text;
+  productEl.style.opacity = "1";
+  if (labelTimer) clearTimeout(labelTimer);
+  labelTimer = setTimeout(() => { productEl.style.opacity = "0"; }, 2500);
+}
+
+function switchProduct() {
+  productIndex = (productIndex + 1) % PRODUCTS.length;
+  try { localStorage.setItem("product", PRODUCTS[productIndex].code); } catch (e) {}
+  render();
+}
+
+document.body.addEventListener("click", switchProduct);
+
 window.addEventListener("resize", layout);
 layout();
-loadFrames();
-setInterval(loadFrames, RECHECK_MIN * 60 * 1000);
+render();
+setInterval(refreshActive, RECHECK_MIN * 60 * 1000);
 </script>
 </body>
 </html>
