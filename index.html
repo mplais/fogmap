@@ -9,6 +9,7 @@
                font-family: -apple-system, sans-serif; }
   #stage { position: absolute; }
   #stage img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  #stage img.frame { visibility: hidden; }
   #status { position: absolute; bottom: 6px; right: 10px; color: #9acd32;
             font-size: 12px; text-shadow: 0 0 3px #000; }
   #product { position: absolute; top: 8px; left: 10px; color: #fff;
@@ -20,7 +21,7 @@
 </head>
 <body>
 <div id="stage">
-  <img id="sat" alt="">
+  <div id="frameHolder"></div>
   <img id="map" alt="">
 </div>
 <div id="product"></div>
@@ -29,11 +30,13 @@
 <script>
 // ---- Settings ----
 
+// Animation on/off. Set to false for a still image of the latest frame
+// that refreshes itself every 5 minutes. Lightest option, nothing to reset.
+const ANIMATE = false;
+
 // Tap the image to cycle through these. Confirmed COD product codes:
 // 01-16 (ABI bands), truecolor, airmass, natcolor, natcolorfire,
-// ntmicro, dcphase, simplewv, sandwich. Add more entries to taste,
-// e.g. { code: "ntmicro", label: "Nighttime Microphysics (fog)" }.
-// Note: truecolor blends to IR at night on its own.
+// ntmicro, dcphase, simplewv, sandwich. truecolor blends to IR at night.
 const PRODUCTS = [
   { code: "02",        label: "Band 2 Visible (0.5 km)" },
   { code: "truecolor", label: "True Color / IR at night (1 km)" }
@@ -43,9 +46,9 @@ const SECTOR_BASE = "https://weather.cod.edu/wxdata/satellite/local/Tahoe/";
 const MAP_URL = SECTOR_BASE + "maps/Tahoe_map.png";
 
 // Frames arrive every 5 minutes at UTC minutes ending in 1 or 6. The
-// seconds in the filename have drifted over time (17, 19, 24, 25 have
-// all appeared), so history probing tries each per time slot. The
-// newest frame always comes from the current/ endpoint, no timestamp.
+// seconds in the filename have drifted over time, so history probing
+// tries each known value. The newest frame always comes from the
+// current/ endpoint, no timestamp needed.
 const SECONDS_LIST = ["17", "19", "24", "25"];
 
 // Focus point as fractions of the 1600x900 frame (0 = left/top).
@@ -55,23 +58,23 @@ const FOCUS_Y = 0.60;
 // Zoom. 1 = frame just covers the window. Higher pushes in on the Bay.
 const ZOOM = 2;
 
-// Animation settings.
-const FRAME_COUNT = 7;       // total frames in the loop, including latest
-const FRAME_MS = 350;        // per frame
-const LAST_FRAME_MS = 1500;  // hold on newest frame
+// Animation settings (ignored when ANIMATE is false).
+const FRAME_COUNT = 6;       // total frames in the loop, including latest
+const FRAME_MS = 400;        // per frame
+const LAST_FRAME_MS = 1800;  // hold on newest frame
 const RECHECK_MIN = 5;       // look for new frames this often
 
 // ---- No changes needed below ----
 
-const sat = document.getElementById("sat");
 const stage = document.getElementById("stage");
+const holder = document.getElementById("frameHolder");
 const statusEl = document.getElementById("status");
 const productEl = document.getElementById("product");
 const errEl = document.getElementById("err");
 document.getElementById("map").src = MAP_URL;
 
 let productIndex = 0;
-let frames = [];
+let frameEls = [];   // [{el, label}] oldest to newest, already loaded
 let animTimer = null;
 let labelTimer = null;
 let loadToken = 0;
@@ -88,7 +91,6 @@ const pad = n => String(n).padStart(2, "0");
   if (i >= 0) productIndex = i;
 })();
 
-// Stable latest-frame endpoint, confirmed in COD's own page source.
 function urlCurrent(code) {
   return SECTOR_BASE + "current/Tahoe." + code + ".jpg?t=" + Date.now();
 }
@@ -99,9 +101,8 @@ function urlHistoric(code, d, secs) {
     "." + pad(d.getUTCHours()) + pad(d.getUTCMinutes()) + secs + ".jpg";
 }
 
-// Recent expected frame times, newest first: minutes ending in 1 or 6.
 function candidateTimes(count) {
-  let t = new Date(Date.now() - 4 * 60 * 1000);  // processing buffer
+  let t = new Date(Date.now() - 4 * 60 * 1000);
   const rem = ((t.getUTCMinutes() - 1) % 5 + 5) % 5;
   t = new Date(t.getTime() - rem * 60 * 1000);
   t.setUTCSeconds(0, 0);
@@ -112,13 +113,21 @@ function candidateTimes(count) {
   return out;
 }
 
-function probe(url) {
+// Load an image fully; resolve with the element or null.
+function loadImg(url) {
   return new Promise(resolve => {
     const im = new Image();
-    im.onload = () => resolve(true);
-    im.onerror = () => resolve(false);
+    im.className = "frame";
+    im.onload = () => resolve(im);
+    im.onerror = () => resolve(null);
     im.src = url;
   });
+}
+
+function showOnly(el, label) {
+  for (const f of frameEls) f.el.style.visibility = "hidden";
+  el.style.visibility = "visible";
+  statusEl.textContent = label;
 }
 
 async function loadFrames() {
@@ -126,53 +135,58 @@ async function loadFrames() {
   const code = PRODUCTS[productIndex].code;
   showProductLabel(PRODUCTS[productIndex].label);
 
-  const found = [];
-
-  // Historical frames for the animation, seconds-drift tolerant.
-  const times = candidateTimes(FRAME_COUNT + 6);
-  for (const t of times) {
-    if (found.length >= FRAME_COUNT - 1) break;
-    for (const secs of SECONDS_LIST) {
-      const url = urlHistoric(code, t, secs);
-      if (await probe(url)) {
-        found.push({
-          url: url,
-          label: pad(t.getUTCHours()) + ":" + pad(t.getUTCMinutes()) + "Z"
-        });
-        break;
-      }
-      if (token !== loadToken) return;
-    }
-    if (token !== loadToken) return;
-  }
-
-  found.reverse();  // oldest first
-
-  // Newest frame from the stable current/ endpoint, appended last.
-  const cur = urlCurrent(code);
-  if (await probe(cur)) {
-    found.push({ url: cur, label: "latest" });
-  }
+  // Step 1: get the newest frame and show it IMMEDIATELY.
+  const curEl = await loadImg(urlCurrent(code));
   if (token !== loadToken) return;
-
-  if (found.length === 0) {
+  if (!curEl) {
     errEl.style.display = "block";
     return;
   }
   errEl.style.display = "none";
-  frames = found;
+
+  // Swap in the new frame set, starting with just the latest.
+  holder.innerHTML = "";
+  frameEls = [{ el: curEl, label: "latest" }];
+  holder.appendChild(curEl);
+  showOnly(curEl, "latest");
+
+  if (!ANIMATE) return;
+
+  // Step 2: quietly build the history for the loop in the background.
+  const history = [];
+  const times = candidateTimes(FRAME_COUNT + 5);
+  for (const t of times) {
+    if (history.length >= FRAME_COUNT - 1) break;
+    for (const secs of SECONDS_LIST) {
+      const el = await loadImg(urlHistoric(code, t, secs));
+      if (token !== loadToken) return;
+      if (el) {
+        history.push({
+          el: el,
+          label: pad(t.getUTCHours()) + ":" + pad(t.getUTCMinutes()) + "Z"
+        });
+        break;
+      }
+    }
+  }
+  if (token !== loadToken) return;
+
+  history.reverse();  // oldest first
+  for (const f of history) holder.appendChild(f.el);
+  frameEls = history.concat(frameEls);  // history + latest at the end
+
   startAnimation();
 }
 
 function startAnimation() {
   if (animTimer) clearTimeout(animTimer);
+  if (frameEls.length < 2) return;
   let i = 0;
   function step() {
-    const f = frames[i];
-    sat.src = f.url;
-    statusEl.textContent = f.label;
-    const dwell = (i === frames.length - 1) ? LAST_FRAME_MS : FRAME_MS;
-    i = (i + 1) % frames.length;
+    const f = frameEls[i];
+    showOnly(f.el, f.label);
+    const dwell = (i === frameEls.length - 1) ? LAST_FRAME_MS : FRAME_MS;
+    i = (i + 1) % frameEls.length;
     animTimer = setTimeout(step, dwell);
   }
   step();
@@ -189,7 +203,6 @@ function switchProduct() {
   productIndex = (productIndex + 1) % PRODUCTS.length;
   try { localStorage.setItem("product", PRODUCTS[productIndex].code); } catch (e) {}
   if (animTimer) clearTimeout(animTimer);
-  frames = [];
   loadFrames();
 }
 
