@@ -92,7 +92,7 @@ const pad = n => String(n).padStart(2, "0");
 })();
 
 function urlCurrent(code) {
-  return SECTOR_BASE + "current/Tahoe." + code + ".jpg?t=" + Date.now();
+  return SECTOR_BASE + "current/Tahoe." + code + ".jpg?t=" + Math.floor(Date.now() / 300000);
 }
 
 function urlHistoric(code, d, secs) {
