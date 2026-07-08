@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bay Area GOES-18 Band 2 (COD Tahoe sector)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+               font-family: -apple-system, sans-serif; }
+  #stage { position: absolute; }
+  #stage img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  #status { position: absolute; bottom: 6px; right: 10px; color: #9acd32;
+            font-size: 12px; text-shadow: 0 0 3px #000; }
+  #err { color: #f66; padding: 16px; font-size: 14px; display: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <img id="sat" alt="">
+  <img id="map" alt="">
+</div>
+<div id="status"></div>
+<div id="err">No recent frames found. COD may be down, or the filename pattern changed.</div>
+<script>
+// ---- Settings ----
+
+// COD NEXLAB Tahoe localized sector, GOES-18 Band 2 (Visible Red, 0.5 km).
+const FRAME_BASE = "https://weather.cod.edu/wxdata/satellite/local/Tahoe/02/";
+const FRAME_PREFIX = "Tahoe.02.";           // Tahoe.02.YYYYMMDD.HHMMSS.jpg
+const MAP_URL = "https://weather.cod.edu/wxdata/satellite/local/Tahoe/maps/Tahoe_map.png";
+
+// COD frame timing: every 5 minutes, UTC minutes ending in 1 or 6,
+// seconds currently fixed at 17. If frames stop loading someday,
+// check a frame URL in the page source at weather.cod.edu/satrad
+// and update SECONDS.
+const SECONDS = "17";
+
+// Focus point as fractions of the 1600x900 frame (0 = left/top).
+// These start values put SF Bay near center. Nudge to taste.
+const FOCUS_X = 0.25;
+const FOCUS_Y = 0.60;
+
+// Zoom. 1 = frame just covers the window (already a wide 16:9 image).
+// 2 or higher pushes in on the Bay Area.
+const ZOOM = 2;
+
+// Animation: number of recent frames to loop, dwell times in ms.
+const FRAME_COUNT = 7;       // set to 1 for a static latest image
+const FRAME_MS = 350;        // per frame
+const LAST_FRAME_MS = 1500;  // hold on newest frame
+const RECHECK_MIN = 5;       // look for a new frame this often
+
+// ---- No changes needed below ----
+
+const sat = document.getElementById("sat");
+const stage = document.getElementById("stage");
+const statusEl = document.getElementById("status");
+document.getElementById("map").src = MAP_URL;
+
+let frames = [];   // [{url, label}] oldest to newest
+let animTimer = null;
+
+const pad = n => String(n).padStart(2, "0");
+
+function urlFor(d) {
+  const name = FRAME_PREFIX +
+    d.getUTCFullYear() + pad(d.getUTCMonth() + 1) + pad(d.getUTCDate()) +
+    "." + pad(d.getUTCHours()) + pad(d.getUTCMinutes()) + SECONDS + ".jpg";
+  return FRAME_BASE + name;
+}
+
+// Recent expected frame times, newest first: minutes congruent to 1 mod 5.
+function candidateTimes(count) {
+  let t = new Date(Date.now() - 2 * 60 * 1000);  // small processing buffer
+  const rem = ((t.getUTCMinutes() - 1) % 5 + 5) % 5;
+  t = new Date(t.getTime() - rem * 60 * 1000);
+  t.setUTCSeconds(0, 0);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push(new Date(t.getTime() - i * 5 * 60 * 1000));
+  }
+  return out;
+}
+
+function probe(url) {
+  return new Promise(resolve => {
+    const im = new Image();
+    im.onload = () => resolve(true);
+    im.onerror = () => resolve(false);
+    im.src = url;
+  });
+}
+
+async function loadFrames() {
+  const times = candidateTimes(FRAME_COUNT + 8);  // extra slots for gaps
+  const found = [];
+  for (const t of times) {
+    if (found.length >= FRAME_COUNT) break;
+    const url = urlFor(t);
+    if (await probe(url)) {
+      found.push({
+        url: url,
+        label: pad(t.getUTCHours()) + ":" + pad(t.getUTCMinutes()) + "Z"
+      });
+    }
+  }
+  if (found.length === 0) {
+    document.getElementById("err").style.display = "block";
+    return;
+  }
+  document.getElementById("err").style.display = "none";
+  frames = found.reverse();  // oldest first
+  startAnimation();
+}
+
+function startAnimation() {
+  if (animTimer) clearTimeout(animTimer);
+  let i = 0;
+  function step() {
+    const f = frames[i];
+    sat.src = f.url;
+    statusEl.textContent = f.label + (i === frames.length - 1 ? " (latest)" : "");
+    const dwell = (i === frames.length - 1) ? LAST_FRAME_MS : FRAME_MS;
+    i = (i + 1) % frames.length;
+    animTimer = setTimeout(step, dwell);
+  }
+  step();
+}
+
+function layout() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  // COD localized sector frames are 1600x900.
+  const iw = 1600, ih = 900;
+  const scale = Math.max(vw / iw, vh / ih) * ZOOM;
+  const w = iw * scale;
+  const h = ih * scale;
+  let x = vw / 2 - FOCUS_X * w;
+  let y = vh / 2 - FOCUS_Y * h;
+  x = Math.min(0, Math.max(vw - w, x));
+  y = Math.min(0, Math.max(vh - h, y));
+  stage.style.width = w + "px";
+  stage.style.height = h + "px";
+  stage.style.left = x + "px";
+  stage.style.top = y + "px";
+}
+
+window.addEventListener("resize", layout);
+layout();
+loadFrames();
+setInterval(loadFrames, RECHECK_MIN * 60 * 1000);
+</script>
+</body>
+</html>
