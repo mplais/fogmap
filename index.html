@@ -15,6 +15,11 @@
                display: none; }
   #radarMap { width: 100%; height: 100%; background: #000; }
   .radarTiles { image-rendering: pixelated; }
+  #home { position: absolute; width: 10px; height: 10px;
+          margin: -6px 0 0 -6px; border: 1.5px solid #fff;
+          border-radius: 50%; pointer-events: none;
+          box-shadow: 0 0 2px 1px rgba(0,0,0,0.75),
+                      inset 0 0 2px 1px rgba(0,0,0,0.75); }
   #status { position: absolute; bottom: 6px; right: 10px; color: #9acd32;
             font-size: 12px; text-shadow: 0 0 3px #000; z-index: 1000; }
   #product { position: absolute; top: 8px; left: 10px; color: #fff;
@@ -29,6 +34,7 @@
 <div id="stage">
   <img id="sat" alt="">
   <img id="map" alt="">
+  <div id="home"></div>
 </div>
 <div id="radarWrap"><div id="radarMap"></div></div>
 <div id="product"></div>
@@ -70,10 +76,22 @@ const RADAR_ZOOM = 8;
 // KMUX radar site location (Mt Umunhum), shown as a small dot.
 const KMUX_LOC = [37.155, -121.898];
 
+// -- Home marker --
+// Exact location used on the radar map.
+const HOME_LOC = [37.74142144974904, -122.26064269366636];
+// Same location as fractions of the COD satellite frame (0 = left/top).
+// Estimated from landmark measurement; refined by screenshot feedback.
+const HOME_FX = 0.260;
+const HOME_FY = 0.620;
+
 // Reflectivity filter: anything below this dBZ value is hidden.
 // 10 removes most clear-air noise. 5 keeps more weak echo (and more
 // junk). Set to -35 to disable filtering entirely.
 const MIN_DBZ = 10;
+
+// Time display for the corner readouts. true = local clock time
+// (9:16 PM), false = UTC (04:16Z).
+const USE_LOCAL_TIME = true;
 
 // -- Shared timing --
 const FRAME_COUNT = 6;       // loop length if ANIMATE is true
@@ -90,6 +108,9 @@ const statusEl = document.getElementById("status");
 const productEl = document.getElementById("product");
 const errEl = document.getElementById("err");
 document.getElementById("map").src = MAP_URL;
+const homeEl = document.getElementById("home");
+homeEl.style.left = (HOME_FX * 100) + "%";
+homeEl.style.top = (HOME_FY * 100) + "%";
 
 let productIndex = 0;
 let frames = [];
@@ -101,6 +122,13 @@ let radarLayer = null;
 let radarBucket = 0;
 
 const pad = n => String(n).padStart(2, "0");
+
+function fmtTime(d) {
+  if (USE_LOCAL_TIME) {
+    return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+  return pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + "Z";
+}
 
 // Pick starting product: URL ?p=code wins, then last saved choice.
 (function initProduct() {
@@ -151,32 +179,23 @@ function probe(url) {
 async function loadFrames() {
   const token = ++loadToken;
   const code = PRODUCTS[productIndex].code;
+  const wanted = ANIMATE ? FRAME_COUNT : 1;
+  const found = [];
 
-  const cur = urlCurrent(code);
-  const ok = await probe(cur);
-  if (token !== loadToken) return;
-  if (!ok) {
-    errEl.style.display = "block";
-    return;
-  }
-  errEl.style.display = "none";
-  frames = [{ url: cur, label: "latest" }];
-  sat.src = cur;
-  statusEl.textContent = "latest";
-
-  if (!ANIMATE) return;
-
-  const history = [];
-  const times = candidateTimes(FRAME_COUNT + 5);
+  // Find the newest timestamped frame (and older ones if animating).
+  // Timestamped files never change, so they cache perfectly.
+  const times = candidateTimes(FRAME_COUNT + 8);
   for (const t of times) {
-    if (history.length >= FRAME_COUNT - 1) break;
+    if (found.length >= wanted) break;
     for (const secs of SECONDS_LIST) {
       const url = urlHistoric(code, t, secs);
       if (await probe(url)) {
-        history.push({
-          url: url,
-          label: pad(t.getUTCHours()) + ":" + pad(t.getUTCMinutes()) + "Z"
-        });
+        found.push({ url: url, label: fmtTime(t) });
+        if (found.length === 1) {
+          errEl.style.display = "none";
+          sat.src = url;
+          statusEl.textContent = "updated " + fmtTime(t);
+        }
         break;
       }
       if (token !== loadToken) return;
@@ -185,9 +204,26 @@ async function loadFrames() {
   }
   if (token !== loadToken) return;
 
-  history.reverse();
-  frames = history.concat(frames);
-  startAnimation();
+  if (found.length === 0) {
+    // Timestamp probing came up empty: fall back to the always-latest
+    // copy, whose exact time is unknown.
+    const cur = urlCurrent(code);
+    const ok = await probe(cur);
+    if (token !== loadToken) return;
+    if (ok) {
+      errEl.style.display = "none";
+      sat.src = cur;
+      statusEl.textContent = "updated recently";
+    } else {
+      errEl.style.display = "block";
+    }
+    return;
+  }
+
+  if (ANIMATE && found.length >= 2) {
+    frames = found.slice().reverse();  // oldest first
+    startAnimation();
+  }
 }
 
 function startAnimation() {
@@ -297,14 +333,15 @@ function ensureRadarMap() {
   leafletMap = L.map("radarMap", {
     zoomControl: false, dragging: false, touchZoom: false,
     scrollWheelZoom: false, doubleClickZoom: false, boxZoom: false,
-    keyboard: false, tapHold: false
+    keyboard: false, tapHold: false, attributionControl: false
   }).setView(RADAR_CENTER, RADAR_ZOOM);
 
-  // Base map without labels.
+  // Credits (hidden from display): basemap (c) OpenStreetMap
+  // contributors and (c) CARTO; radar data via Iowa Environmental
+  // Mesonet, Iowa State University.
   L.tileLayer(
     "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png",
-    { subdomains: "abcd", maxZoom: 12,
-      attribution: "&copy; OSM &copy; CARTO | radar: IEM" }
+    { subdomains: "abcd", maxZoom: 12 }
   ).addTo(leafletMap);
 
   // Labels in their own pane ABOVE the radar so geography stays visible.
@@ -319,6 +356,15 @@ function ensureRadarMap() {
   L.circleMarker(KMUX_LOC, {
     radius: 3, color: "#9acd32", fillColor: "#9acd32", fillOpacity: 1
   }).addTo(leafletMap);
+
+  // Home: hollow ring, dark halo under a white stroke so it reads on
+  // any background without covering the data inside it.
+  L.circleMarker(HOME_LOC, {
+    radius: 6, color: "rgba(0,0,0,0.75)", weight: 4, fill: false
+  }).addTo(leafletMap);
+  L.circleMarker(HOME_LOC, {
+    radius: 6, color: "#fff", weight: 1.5, fill: false
+  }).addTo(leafletMap);
 }
 
 function refreshRadar() {
@@ -330,24 +376,26 @@ function refreshRadar() {
   fetchScanTime();
 }
 
-// Scan time from IEM metadata; falls back to a plain label if the
-// format differs or the request is blocked.
+// Scan time and operating mode from IEM's metadata service (verified
+// format: meta[] entries with site, valid, vcp). VCP 31/32/35 are
+// clear-air patterns; everything else is a precipitation pattern.
 async function fetchScanTime() {
   try {
     const r = await fetch(
-      "https://mesonet.agron.iastate.edu/data/gis/images/4326/ridge/MUX/N0B_0.json"
+      "https://mesonet.agron.iastate.edu/json/ridge_current.py?product=N0B"
     );
     if (!r.ok) throw new Error("bad status");
     const j = await r.json();
-    const valid = j && j.meta && (j.meta.valid || j.meta.utc_valid);
-    if (valid) {
-      const m = String(valid).match(/T(\d{2}:\d{2})/);
-      statusEl.textContent = "KMUX scan " + (m ? m[1] + "Z" : valid);
-      return;
-    }
-    throw new Error("no time field");
+    const entry = (j.meta || []).find(m => m.site === "MUX");
+    if (!entry) throw new Error("no MUX entry");
+    const clearAir = [31, 32, 35].includes(Number(entry.vcp));
+    const mode = clearAir ? "clear air" : "precip mode";
+    const d = new Date(entry.valid);
+    let text = fmtTime(d) + " \u2022 " + mode;
+    if (Date.now() - d.getTime() > 30 * 60 * 1000) text += " (stale)";
+    statusEl.textContent = text;
   } catch (e) {
-    statusEl.textContent = "KMUX N0B";
+    statusEl.textContent = "scan time unavailable";
   }
 }
 
